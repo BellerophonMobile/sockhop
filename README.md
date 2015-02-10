@@ -6,7 +6,7 @@ websocket library.
 
 ## License
 
-Logberry is provided under the open source
+SockHop is provided under the open source
 [MIT license](http://opensource.org/licenses/MIT):
 
 > The MIT License (MIT)

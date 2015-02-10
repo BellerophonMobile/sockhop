@@ -11,6 +11,12 @@ type Authenticator interface {
 	AuthenticateUserPass(sock *Sock, user string, pass string) error
 }
 
+type authrequest struct {
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+	JWT      string `json:"jwt,omitempty"`
+}
+
 func (x *Sock) authenticate(conf *SockConf) error {
 
 	if conf.Authenticator == nil {
@@ -29,23 +35,18 @@ func (x *Sock) authenticate(conf *SockConf) error {
 		return task.Failure("Expected credentials in text message")
 	}
 
-	var authrequest struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-		JWT      string `json:"jwt"`
-	}
+	var auth authrequest
 
-	err = json.Unmarshal(message, &authrequest)
+	err = json.Unmarshal(message, &auth)
 	if err != nil {
 		return task.Error(err)
 	}
 
-	
 	//-- Check the given credentials
-	if authrequest.JWT != "" {
-		err = conf.Authenticator.AuthenticateJWT(x, authrequest.JWT)
-	} else if authrequest.Username != "" && authrequest.Password != "" {
-		err = conf.Authenticator.AuthenticateUserPass(x, authrequest.Username, authrequest.Password)
+	if auth.JWT != "" {
+		err = conf.Authenticator.AuthenticateJWT(x, auth.JWT)
+	} else if auth.Username != "" && auth.Password != "" {
+		err = conf.Authenticator.AuthenticateUserPass(x, auth.Username, auth.Password)
 	} else {
 		err = logberry.NewError("Credentials expected but not given")
 	}
@@ -54,4 +55,28 @@ func (x *Sock) authenticate(conf *SockConf) error {
 	}
 
 	return task.Success()
+}
+
+func (x *Sock) sendauthentication(conf *SockConf) error {
+
+	if conf.JWT == "" && conf.User == "" && conf.Pass == "" {
+		return nil
+	}
+
+	task := x.Log.Task("Authenticate")
+	
+	auth := &authrequest{JWT: conf.JWT, Username: conf.User, Password: conf.Pass}
+
+	bytes, err := json.Marshal(auth)
+	if err != nil {
+		return task.WrapError("Could not marshal credentials", err)
+	}
+
+	err = x.Socket.WriteMessage(websocket.TextMessage, bytes)
+	if err != nil {
+		return task.WrapError("Could not send credentials", err)
+	}
+
+	return task.Success()
+
 }
