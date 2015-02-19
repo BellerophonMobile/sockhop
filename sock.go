@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"github.com/gorilla/websocket"
 	"net/http"
+	"time"
 )
 
 type Hook func(*Message) error
@@ -21,11 +22,16 @@ type Sock struct {
 
 	BinaryHandler func([]byte) error
 	ErrorHandler func(error) error
-	
+
+	Live bool
+
 	doneloop chan bool
 	messages uint64
 
-	Live bool
+	awaiting map[uint64]chan *Message
+	regawaiting chan *rsvp
+	doneawaiting chan bool
+	
 }
 
 var Upgrader websocket.Upgrader
@@ -51,10 +57,77 @@ func NewSock(conf *SockConf) (*Sock, error) {
 	x.TextHooks = make(map[string]Hook)
 	
 	x.doneloop = make(chan bool, 1)
-	
+
+	x.awaiting = make(map[uint64]chan *Message)
+	x.regawaiting = make(chan *rsvp)
+	x.doneawaiting = make(chan bool, 1)
+	go x.manageawaiting()
+
 	return &x, nil
 }
 
+type rsvpaction int
+const (
+	rsvp_register rsvpaction = iota
+	rsvp_unregister
+	rsvp_receive
+)
+
+type rsvp struct {
+	action rsvpaction
+	id uint64
+	handler chan *Message
+	timeout time.Duration
+	message *Message
+	err chan error
+}
+
+func (x *Sock) timeoutrsvp(r *rsvp) {
+	time.Sleep(r.timeout)
+	x.regawaiting <- &rsvp{action: rsvp_unregister, id: r.id}
+}
+
+func (x *Sock) manageawaiting() {
+
+	var done bool
+	
+	for !done {
+		select {
+		case r := <- x.regawaiting:
+
+			switch r.action {
+			case rsvp_register:
+				x.awaiting[r.id] = r.handler
+
+				if r.timeout > 0 {
+					go x.timeoutrsvp(r)
+				}
+				
+			case rsvp_unregister:
+				handler, ok := x.awaiting[r.id]
+				if ok {
+					delete(x.awaiting, r.id)
+					close(handler)
+				}
+
+			case rsvp_receive:
+				handler,ok := x.awaiting[r.message.InResponseTo]
+				if !ok {
+					r.err <- logberry.NewError("Not expecting response to", r.message.InResponseTo)
+					continue
+				}
+				
+				delete(x.awaiting, r.message.InResponseTo)
+				handler <- r.message
+
+			}
+			
+		case <- x.doneawaiting:
+			done = true
+		}
+	}
+	
+}
 
 // Upgrade converts an HTTP connection into a web socket.  An active
 // Sock is returned, or an error if there is a problem.
@@ -88,8 +161,6 @@ func Upgrade(w http.ResponseWriter, r *http.Request, conf *SockConf) (*Sock, err
 
 	x.Live = true
 
-	x.Log.Info("Connected")
-	
 	return x, nil
 
 }
@@ -144,6 +215,7 @@ func (x *Sock) AddHook(code string, hook Hook) {
 func (x *Sock) Close() {
 	x.Live = false
 	x.doneloop <- true
+	x.doneawaiting <- true
 	x.Socket.Close()
 }
 
@@ -227,28 +299,31 @@ func (x *Sock) processError(err error) error {
 }
 
 func (x *Sock) processText(data []byte) error {
-
+	
 	var message	Message
 	message.Sock = x
 
-	err := json.Unmarshal(data, message)
+	err := json.Unmarshal(data, &message)
 	if err != nil {
 		return err
 	}
 
-	/*
-	if message.inResponseTo != 0 {
-		// Look up what it was in response to, and handle it
+	if message.InResponseTo != 0 {
+		e := make(chan error)
+		x.regawaiting <- &rsvp{action: rsvp_receive, message: &message, err: e}
+		return <- e
 	}
-	*/
 
 	fn,ok := x.TextHooks[message.Code]
 	if !ok {
-		return x.Log.Failure("Received unexpected text message for code ",
-			message.Code)
+		return x.Log.Failure("Received unexpected text message",
+			&logberry.D{"Code": message.Code})
 	}
 
-	return fn(&message)
+	fn(&message)
+
+	// processText specifically does not return errors from handlers
+	return nil
 
 }
 
@@ -268,30 +343,64 @@ func (x *Sock) SendFault(msg string) error {
 	
 }
 
-func (x *Sock) SendMessage(code string, data interface{}) error {
+func (x *Sock) newmessage(code string, data interface{}) (*Message,error) {
 
-	var err error
+	var message = &Message{Code: code,
+	                       ID: atomic.AddUint64(&x.messages, 1)}
 	
-	var message Message
-	message.Code = code
-	message.ID = atomic.AddUint64(&x.messages, 1)
 	bytes,err := json.Marshal(data)
 	if err != nil {
-		return x.Log.WrapError("Could not marshal data", err)
+		return nil,logberry.WrapError(err, "Could not marshal message data")
 	}
 	message.Data = string(bytes)	
 
-	bytes, err = json.Marshal(message)
+	return message,nil
+	
+}
+
+func (x *Sock) sendmessage(message *Message) error {
+
+	bytes, err := json.Marshal(message)
 	if err != nil {
 		return x.Log.WrapError("Could not marshal message", err)
 	}
 
 	err = x.Socket.WriteMessage(websocket.TextMessage, bytes)
 	if err != nil {
-		return x.Log.WrapError("Could not write command", err)
+		return x.Log.WrapError("Could not write message", err)
 	}
 
 	return nil
+
+}
+
+func (x *Sock) SendMessage(code string, data interface{}) error {
+
+	message, err := x.newmessage(code, data)
+	if err != nil {
+		return x.Log.Error(err)
+	}
+
+	return x.sendmessage(message)
+	
+}
+
+func (x *Sock) SendRequest(code string, data interface{}, handler chan *Message, timeout time.Duration) error {
+
+	message, err := x.newmessage(code, data)
+	if err != nil {
+		return x.Log.Error(err)
+	}
+
+	r := &rsvp{
+		action: rsvp_register,
+		id: message.ID,
+		handler: handler,
+		timeout: timeout,
+	}
+	x.regawaiting <- r
+		
+	return x.sendmessage(message)
 
 }
 
