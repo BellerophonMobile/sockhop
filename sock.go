@@ -36,6 +36,10 @@ type Sock struct {
 
 var Upgrader websocket.Upgrader
 
+func init() {
+	Upgrader.CheckOrigin = func(r *http.Request) bool { return true }
+}
+
 // NewSock returns an unconnected Sock.  Parameter conf may be nil.
 func NewSock(conf *SockConf) (*Sock, error) {
 
