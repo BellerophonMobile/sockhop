@@ -1,7 +1,7 @@
 package sockhop
 
 import (
-	"sync/atomic"
+//	"sync/atomic"
 	"github.com/BellerophonMobile/logberry"
 	"encoding/json"
 	"github.com/gorilla/websocket"
@@ -122,6 +122,8 @@ func (x *Sock) manageawaiting() {
 				}
 				
 				delete(x.awaiting, r.message.InResponseTo)
+				close(r.err)
+
 				handler <- r.message
 
 			}
@@ -267,7 +269,7 @@ func (x *Sock) Loop() error {
 	for !done && err == nil {
 
 		go x.readmessage(readmsg)
-
+		
 		select {
 		case msg := <- readmsg:
 
@@ -311,7 +313,7 @@ func (x *Sock) processText(data []byte) error {
 	if err != nil {
 		return err
 	}
-
+	
 	if message.InResponseTo != 0 {
 		e := make(chan error)
 		x.regawaiting <- &rsvp{action: rsvp_receive, message: &message, err: e}
@@ -325,7 +327,7 @@ func (x *Sock) processText(data []byte) error {
 	}
 
 	fn(&message)
-
+	
 	// processText specifically does not return errors from handlers
 	return nil
 
@@ -349,8 +351,11 @@ func (x *Sock) SendFault(msg string) error {
 
 func (x *Sock) newmessage(code string, data interface{}) (*Message,error) {
 
+	x.messages += 1
 	var message = &Message{Code: code,
-	                       ID: atomic.AddUint64(&x.messages, 1)}
+	                       ID: x.messages}
+	//	                   ID: atomic.AddUint64(&x.messages, 1)}
+	//                     ** atomic call has problems on arm? **
 	
 	bytes,err := json.Marshal(data)
 	if err != nil {
